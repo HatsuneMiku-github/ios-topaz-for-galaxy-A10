@@ -95,24 +95,22 @@ jobs:
           restore-keys: |
             ccache-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
 
+   
       - name: Build
         working-directory: dxb
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: |
-                          - name: Build
-        working-directory: dxb
-        env:
-          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: |
+          set -o pipefail
           ccache -z
           bash build.sh 2>&1 | tee build.log
           echo "=== XNU machine configuration ==="
           grep -n -E 'SUPPORTED_ARM64_MACHINE_CONFIGS|ARM64_BOARD_CONFIG_SWEET' xnu/makedefs/MakeInc.def || true
           echo "=== Patch application results ==="
-          grep -E 'Applying patch:|Skipping patch' build.log || true
+          grep -Ei 'applying patch|skipping patch|patch failed|error:' build.log || true
           ccache -s
+
 
       - name: Package build tree for local compiles
         if: always()
