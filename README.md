@@ -1,8 +1,8 @@
 # ios-topaz
 
-**Apple's iOS 16 running on a Redmi Note 12 4G.**
+**Apple's iOS 16 running on a Galaxy A10.**
 
-This is a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (Apple's open-source XNU kernel, xnu-8796, on a Redmi Note 10 Pro) to the Xiaomi **Redmi Note 12 4G** (`topaz` / `tapas`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
+This is a fork based on a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (Apple's open-source XNU kernel, xnu-8796, on a Redmi Note 10 Pro) to the Xiaomi **Redmi Note 12 4G** (`topaz` / `tapas`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
 As of **2026-10-18** the phone boots to the **iOS lock screen** in about 3 minutes, on the four Cortex-A73 cores. Rendering runs entirely on the CPU; there is no GPU driver. Touch is being brought up (see the roadmap); without it the lock screen cannot be unlocked yet.
 
