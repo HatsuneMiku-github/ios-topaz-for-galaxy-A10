@@ -117,36 +117,33 @@ index 997a4ab..db26bbe 100644
 +	.receive_data = fbcon_receive_data,
 +	.device = SERIAL_SWEET_FBCON
 +};
-+
-+static void
-+fbcon_probe(void)
-+{
-+	DTEntry entry;
-+	uint64_t const *reg;
-+	uint32_t const *val;
-+	unsigned int size;
-+
-+	if (SecureDTFindEntry("name", "sweet-fbcon", &entry) != kSuccess ||
-+	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
-+		return;
-+	}
-+	if (SecureDTGetProperty(entry, "width", (void const **)&val, &size) == kSuccess) {
-+		fbcon_width = *val;
-+	}
-+	if (SecureDTGetProperty(entry, "height", (void const **)&val, &size) == kSuccess) {
-+		fbcon_height = *val;
-+	}
-+	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
-+		fbcon_stride = *val;
-+	}
-+	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
-+		return;
-+	}
-+	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
-+	if (fbcon_base != NULL) {
-+		register_serial_functions(&sweet_fbcon_serial_functions);
-+	}
-+}
+static void
+fbcon_probe(void)
+{
+	const uint64_t fb_phys = 0xEC000000ULL;
+	const uint64_t fb_size = 0x01400000ULL;
+	uint64_t frame_size;
+
+	/* Galaxy A10 display configuration. */
+	fbcon_width = 720;
+	fbcon_height = 1520;
+	fbcon_stride = 720 * 4; /* 32 bpp, tightly packed */
+
+	frame_size = (uint64_t)fbcon_stride * fbcon_height;
+
+	if (fbcon_stride < fbcon_width * sizeof(uint32_t) ||
+	    (fbcon_stride % sizeof(uint32_t)) != 0 ||
+	    frame_size > fb_size) {
+		return;
+	}
+
+	fbcon_base = (volatile uint32_t *)
+	    ml_io_map_wcomb(fb_phys, fb_size);
+
+	if (fbcon_base != NULL) {
+		register_serial_functions(&sweet_fbcon_serial_functions);
+	}
+}
 +
  #if HIBERNATION
  /**
