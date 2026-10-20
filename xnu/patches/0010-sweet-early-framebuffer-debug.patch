@@ -150,8 +150,7 @@ index 0000000..8f4c808
 +/*
 + * Galaxy A10 bootstrap console. No allocation, locks, ADT parsing or
 + * per-CPU state: panic() can reach this before a current thread exists.
-+ * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
-+ * Stop using that mapping before arm_vm_init tears down bootstrap TTBR0.
++ * start.s maps the splash framebuffer VA=PA as Normal write-combining memory.
 + */
 +#include <arm64/sweet_early.h>
 +
@@ -174,7 +173,7 @@ index 0000000..8f4c808
  #define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
 
  extern unsigned char iso_font[256 * 16];
- +
+ 
 +/* Initialized data must remain writable until disable, including panics. */
 +static unsigned int early_row, early_col;
 +static unsigned int early_started, early_disabled, early_panicking;
