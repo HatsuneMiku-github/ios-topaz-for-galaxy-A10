@@ -52,11 +52,11 @@ index 997a4ab..db26bbe 100644
 +static void
 +fbcon_init(void)
 +{
-+	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
-+	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
-+	fbcon_col = fbcon_row = 0;
-+	for (uint32_t r = 0; r < fbcon_rows; r++) {
-+		fbcon_clear_row(r);
++	if (fbcon_width < 8 * FBCON_SCALE ||
+    fbcon_height < 16 * FBCON_SCALE ||
+    fbcon_stride < fbcon_width * sizeof(uint32_t)) {
+    return;
+}
 +	}
 +}
 +
