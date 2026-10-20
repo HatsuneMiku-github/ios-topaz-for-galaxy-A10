@@ -55,12 +55,17 @@ fbcon_init(void)
 	if (fbcon_width < 8 * FBCON_SCALE ||
 	    fbcon_height < 16 * FBCON_SCALE ||
 	    fbcon_stride < fbcon_width * sizeof(uint32_t) ||
-	    fbcon_rows == 0) {
+	    (fbcon_stride % sizeof(uint32_t)) != 0) {
 		return;
 	}
 
 	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
 	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
+
+	if (fbcon_cols == 0 || fbcon_rows == 0) {
+		return;
+	}
+
 	fbcon_col = 0;
 	fbcon_row = 0;
 
