@@ -96,10 +96,10 @@ index ccbb188..777aca4 100644
  
 +#if defined(SWEET)
 +	/* Stage 0: white 64x32 band, no stack or page tables needed. */
-+	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (0xEC000000 + (1520 - 32) * 2880)
 +	mov		w1, #-1
 +	mov		x2, #32
-+	mov		x4, #4320
++	mov		x4, #2880
 +Lsweet_mark_row:
 +	mov		x3, #64
 +	mov		x5, x0
@@ -147,29 +147,33 @@ index 0000000..8f4c808
 +++ b/osfmk/arm64/sweet_early.c
 @@ -0,0 +1,130 @@
 +/*
-+ * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
++ * Galaxy A10 bootstrap console. No allocation, locks, ADT parsing or
 + * per-CPU state: panic() can reach this before a current thread exists.
 + * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
 + * Stop using that mapping before arm_vm_init tears down bootstrap TTBR0.
 + */
 +#include <arm64/sweet_early.h>
 +
-+#if defined(SWEET)
-+#include <stdint.h>
-+#include <kern/misc_protos.h>
-+
-+#define EARLY_FB ((volatile uint32_t *)(uintptr_t)0x9c000000)
-+#define EARLY_WIDTH 1080u
-+#define EARLY_HEIGHT 2400u
-+#define EARLY_STRIDE (4320u / 4)
-+#define EARLY_SCALE 2u
-+#define EARLY_CELL_W (8u * EARLY_SCALE)
-+#define EARLY_CELL_H (16u * EARLY_SCALE)
-+#define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)
-+#define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
-+
-+extern unsigned char iso_font[256 * 16];
-+
+ #if defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+
+-#define EARLY_FB ((volatile uint32_t *)(uintptr_t)0x9c000000)
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_FB ((volatile uint32_t *)(uintptr_t)0xEC000000)
++#define EARLY_WIDTH 720u
++#define EARLY_HEIGHT 1520u
++#define EARLY_STRIDE (2880u / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+ #define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)
+ #define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
+
+ extern unsigned char iso_font[256 * 16];
+ +
 +/* Initialized data must remain writable until disable, including panics. */
 +static unsigned int early_row, early_col;
 +static unsigned int early_started, early_disabled, early_panicking;
