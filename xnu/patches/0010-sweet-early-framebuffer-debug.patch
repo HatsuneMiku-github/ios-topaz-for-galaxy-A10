@@ -93,7 +93,7 @@ index ccbb188..777aca4 100644
 @@ -463,6 +463,25 @@ LEXT(start_first_cpu)
  	mov		x20, x0
  	mov		x21, #0
- 
+
 +#if defined(SWEET)
 +	/* Stage 0: white 64x32 band, no stack or page tables needed. */
 +	MOV64	x0, (0xEC000000 + (1520 - 32) * 2880)
