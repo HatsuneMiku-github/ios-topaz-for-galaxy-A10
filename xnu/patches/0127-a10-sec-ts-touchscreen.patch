@@ -1,0 +1,610 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@
+ bsd/dev/sweet_touch.c standard
++bsd/dev/sweet_touch_a10.c standard
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@
+-	sweet_touch_init();
++	extern void a10_sec_touch_init(void);
++	a10_sec_touch_init();
+
+diff --git a/bsd/dev/sweet_touch_a10.c b/bsd/dev/sweet_touch_a10.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_touch_a10.c
+@@
++#include <sys/types.h>
++#include <sys/systm.h>
++
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++
++#include <mach/kern_return.h>
++#include <mach/machine_routines.h>
++#include <mach/vm_param.h>
++
++#include <stdint.h>
++#include <stdbool.h>
++
++/*
++ * Galaxy A10 Samsung SEC_TS touchscreen.
++ *
++ * This is a BSD-side driver because this Topaz port already delivers
++ * touchscreen reports through sweet_hid_touch(). It deliberately does
++ * not use an IOService/IOI2CInterface hierarchy that the Exynos tree
++ * has not established.
++ *
++ * IMPORTANT:
++ * - I2C base comes from the board DT fragment supplied for this port.
++ * - This driver assumes the I2C clock, pin mux, and touchscreen supply
++ *   have already been enabled by earlier firmware/platform setup.
++ * - It does not upload firmware, reset the controller, or run factory
++ *   commands.
++ */
++
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++
++#define A10_SEC_TS_I2C_BASE       0x13870000u
++#define A10_SEC_TS_I2C_SIZE       0x100u
++#define A10_SEC_TS_ADDRESS        0x48u
++
++#define SEC_TS_CMD_SENSE_ON       0x10u
++#define SEC_TS_CMD_SENSE_OFF      0x11u
++#define SEC_TS_READ_DEVICE_ID     0x22u
++#define SEC_TS_READ_PANEL_INFO    0x23u
++#define SEC_TS_READ_BOOT_STATUS   0x55u
++#define SEC_TS_READ_ONE_EVENT     0x60u
++#define SEC_TS_READ_ALL_EVENT     0x61u
++#define SEC_TS_CMD_CLEAR_EVENTS   0x62u
++
++#define SEC_TS_ACK_BOOT_COMPLETE  0x00u
++#define SEC_TS_STATUS_INFO        0x02u
++#define SEC_TS_STATUS_VENDOR_INFO 0x07u
++
++#define SEC_TS_EVENT_SIZE         8u
++#define SEC_TS_MAX_EVENTS         32u
++#define SEC_TS_MAX_CONTACTS       10u
++
++/* A10 panel resolution. sweet_hid_touch() receives screen coordinates. */
++#define A10_SCREEN_WIDTH          720u
++#define A10_SCREEN_HEIGHT         1520u
++
++/* Inclusive maximum raw coordinate limits from sec,max_coords. */
++#define SEC_TS_RAW_MAX_X          4095u
++#define SEC_TS_RAW_MAX_Y          3541u
++
++/* S3C2440-compatible I2C controller registers. */
++#define IICCON                    0x00u
++#define IICSTAT                   0x04u
++#define IICADD                    0x08u
++#define IICDS                     0x0Cu
++#define IICLC                     0x10u
++#define IICINT                    0x20u
++
++#define IICCON_ACKEN              (1u << 7)
++#define IICCON_TXDIV_512          (1u << 6)
++#define IICCON_IRQEN              (1u << 5)
++#define IICCON_IRQPEND            (1u << 4)
++#define IICCON_SCALE(x)           ((x) & 0x0Fu)
++
++#define IICSTAT_MASTER_RX         (2u << 6)
++#define IICSTAT_MASTER_TX         (3u << 6)
++#define IICSTAT_START             (1u << 5)
++#define IICSTAT_TXRXEN            (1u << 4)
++#define IICSTAT_LASTBIT           (1u << 0)
++
++#define SEC_TS_POLL_MS            8u
++#define SEC_TS_I2C_TIMEOUT_US     10000u
++#define SEC_TS_READY_RETRIES      100u
++
++struct sec_ts_state {
++    vm_offset_t regs;
++    bool started;
++    bool bus_ready;
++    bool controller_ready;
++    bool logged_bus_error;
++    bool active[SEC_TS_MAX_CONTACTS];
++    int last_x[SEC_TS_MAX_CONTACTS];
++    int last_y[SEC_TS_MAX_CONTACTS];
++    uint32_t raw_max_x;
++    uint32_t raw_max_y;
++    uint8_t tx_count;
++    uint8_t rx_count;
++};
++
++static struct sec_ts_state sec_ts;
++
++static inline uint32_t
++sec_rd(uint32_t offset)
++{
++    return *(volatile uint32_t *)(sec_ts.regs + offset);
++}
++
++static inline void
++sec_wr(uint32_t offset, uint32_t value)
++{
++    *(volatile uint32_t *)(sec_ts.regs + offset) = value;
++}
++
++static void
++sec_sleep_ms(uint32_t ms)
++{
++    /*
++     * Timed wait rather than a millisecond-long busy loop.
++     * The worker starts after the scheduler is running.
++     */
++    assert_wait_timeout((event_t)&sec_ts, THREAD_UNINT, ms, 1000000u);
++    (void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++sec_i2c_clear_pending(void)
++{
++    uint32_t value = sec_rd(IICCON);
++
++    /* IRQPEND is write-one-to-clear on this controller. */
++    sec_wr(IICCON, value | IICCON_IRQPEND);
++}
++
++static void
++sec_i2c_set_ack(bool enabled)
++{
++    uint32_t value = sec_rd(IICCON);
++
++    /*
++     * Do not write one to IRQPEND here. Keep a pending byte event
++     * pending until sec_i2c_clear_pending() explicitly acknowledges it.
++     */
++    value &= ~IICCON_IRQPEND;
++    if (enabled)
++        value |= IICCON_ACKEN;
++    else
++        value &= ~IICCON_ACKEN;
++
++    sec_wr(IICCON, value);
++}
++
++static bool
++sec_i2c_wait_pending(void)
++{
++    uint32_t elapsed;
++
++    for (elapsed = 0; elapsed < SEC_TS_I2C_TIMEOUT_US; elapsed += 10u) {
++        if (sec_rd(IICCON) & IICCON_IRQPEND)
++            return true;
++        delay(10);
++    }
++
++    return false;
++}
++
++static void
++sec_i2c_stop(void)
++{
++    /*
++     * Clear START while leaving the controller in master-transmit
++     * mode to generate STOP. Then restore ACKing for the next transfer.
++     */
++    sec_wr(IICSTAT, IICSTAT_MASTER_TX | IICSTAT_TXRXEN);
++    sec_wr(IICCON, IICCON_ACKEN | IICCON_SCALE(0x0F) |
++                  IICCON_IRQPEND);
++}
++
++static bool
++sec_i2c_start(uint8_t address, bool read)
++{
++    sec_wr(IICDS, ((uint32_t)address << 1) | (read ? 1u : 0u));
++
++    sec_wr(IICSTAT,
++           (read ? IICSTAT_MASTER_RX : IICSTAT_MASTER_TX) |
++           IICSTAT_START | IICSTAT_TXRXEN);
++
++    if (!sec_i2c_wait_pending())
++        return false;
++
++    /* LASTBIT indicates a NACK in master-transmit address phases. */
++    if (sec_rd(IICSTAT) & IICSTAT_LASTBIT) {
++        sec_i2c_clear_pending();
++        return false;
++    }
++
++    sec_i2c_clear_pending();
++    return true;
++}
++
++static bool
++sec_i2c_send_byte(uint8_t byte)
++{
++    sec_wr(IICDS, byte);
++
++    if (!sec_i2c_wait_pending())
++        return false;
++
++    if (sec_rd(IICSTAT) & IICSTAT_LASTBIT) {
++        sec_i2c_clear_pending();
++        return false;
++    }
++
++    sec_i2c_clear_pending();
++    return true;
++}
++
++static bool
++sec_i2c_write(uint8_t reg, const uint8_t *data, uint32_t length)
++{
++    uint32_t i;
++
++    if (!sec_ts.bus_ready || (length != 0 && data == NULL))
++        return false;
++
++    sec_i2c_set_ack(true);
++
++    if (!sec_i2c_start(A10_SEC_TS_ADDRESS, false))
++        goto fail;
++    if (!sec_i2c_send_byte(reg))
++        goto fail;
++
++    for (i = 0; i < length; i++) {
++        if (!sec_i2c_send_byte(data[i]))
++            goto fail;
++    }
++
++    sec_i2c_stop();
++    return true;
++
++fail:
++    sec_i2c_stop();
++    return false;
++}
++
++static bool
++sec_i2c_read(uint8_t reg, uint8_t *data, uint32_t length)
++{
++    uint32_t i;
++
++    if (!sec_ts.bus_ready || data == NULL || length == 0)
++        return false;
++
++    sec_i2c_set_ack(true);
++
++    /* Address + register index. */
++    if (!sec_i2c_start(A10_SEC_TS_ADDRESS, false))
++        goto fail;
++    if (!sec_i2c_send_byte(reg))
++        goto fail;
++
++    /*
++     * The final received byte must be NACKed. For a one-byte read,
++     * disable ACK before starting the receive address phase.
++     */
++    sec_i2c_set_ack(length > 1);
++    if (!sec_i2c_start(A10_SEC_TS_ADDRESS, true))
++        goto fail;
++
++    for (i = 0; i < length; i++) {
++        if (!sec_i2c_wait_pending())
++            goto fail;
++
++        data[i] = (uint8_t)(sec_rd(IICDS) & 0xFFu);
++
++        /*
++         * Change ACKEN while the penultimate byte is pending, so the
++         * final byte will be NACKed. Do not clear IRQPEND until after
++         * this ACK selection has been written.
++         */
++        if (i + 2u == length)
++            sec_i2c_set_ack(false);
++
++        if (i + 1u == length) {
++            sec_i2c_stop();
++            return true;
++        }
++
++        sec_i2c_clear_pending();
++    }
++
++fail:
++    sec_i2c_stop();
++    return false;
++}
++
++static int
++sec_scale_coordinate(uint32_t raw, uint32_t raw_max, uint32_t screen_max)
++{
++    uint64_t scaled;
++
++    if (raw_max == 0 || screen_max == 0)
++        return 0;
++
++    if (raw > raw_max)
++        raw = raw_max;
++
++    scaled = ((uint64_t)raw * (uint64_t)screen_max) / raw_max;
++    if (scaled > screen_max)
++        scaled = screen_max;
++
++    return (int)scaled;
++}
++
++static void
++sec_ts_release_all(void)
++{
++    unsigned int i;
++
++    for (i = 0; i < SEC_TS_MAX_CONTACTS; i++) {
++        if (!sec_ts.active[i])
++            continue;
++
++        sweet_hid_touch((int)i, 0,
++                        sec_ts.last_x[i], sec_ts.last_y[i]);
++        sec_ts.active[i] = false;
++    }
++}
++
++static void
++sec_ts_handle_event(const uint8_t event[SEC_TS_EVENT_SIZE])
++{
++    uint8_t type, tid, action;
++    uint32_t raw_x, raw_y;
++    int x, y;
++    unsigned int slot;
++
++    type = event[0] & 0x03u;
++    if (type != 0u) {
++        /* Status and gesture events are not finger reports. */
++        return;
++    }
++
++    tid = (event[0] >> 2) & 0x0Fu;
++    action = (event[0] >> 6) & 0x03u;
++
++    /* SEC_TS contact IDs are one-based; HID fingers are zero-based. */
++    if (tid == 0 || tid > SEC_TS_MAX_CONTACTS)
++        return;
++
++    slot = (unsigned int)(tid - 1u);
++
++    raw_x = ((uint32_t)event[1] << 4) |
++            ((uint32_t)event[3] & 0x0Fu);
++    raw_y = ((uint32_t)event[2] << 4) |
++            ((uint32_t)event[3] >> 4);
++
++    x = sec_scale_coordinate(raw_x, sec_ts.raw_max_x,
++                             A10_SCREEN_WIDTH - 1u);
++    y = sec_scale_coordinate(raw_y, sec_ts.raw_max_y,
++                             A10_SCREEN_HEIGHT - 1u);
++
++    if (action == 1u || action == 2u) {
++        /*
++         * The existing HID bridge expects down=1 for both press and
++         * movement. Calling it here is the crucial missing input path.
++         */
++        sweet_hid_touch((int)slot, 1, x, y);
++        sec_ts.active[slot] = true;
++        sec_ts.last_x[slot] = x;
++        sec_ts.last_y[slot] = y;
++    } else if (action == 3u) {
++        if (sec_ts.active[slot]) {
++            sweet_hid_touch((int)slot, 0, x, y);
++            sec_ts.active[slot] = false;
++            sec_ts.last_x[slot] = x;
++            sec_ts.last_y[slot] = y;
++        }
++    }
++}
++
++static bool
++sec_ts_read_event_batch(void)
++{
++    uint8_t events[SEC_TS_MAX_EVENTS][SEC_TS_EVENT_SIZE];
++    uint8_t remaining;
++    uint32_t i;
++
++    bzero(events, sizeof(events));
++
++    if (!sec_i2c_read(SEC_TS_READ_ONE_EVENT, events[0],
++                      SEC_TS_EVENT_SIZE))
++        return false;
++
++    if (events[0][0] == 0)
++        return true;
++
++    remaining = events[0][7] & 0x3Fu;
++    if (remaining > SEC_TS_MAX_EVENTS - 1u) {
++        (void)sec_i2c_write(SEC_TS_CMD_CLEAR_EVENTS, NULL, 0);
++        sec_ts_release_all();
++        return true;
++    }
++
++    if (remaining != 0) {
++        if (!sec_i2c_read(SEC_TS_READ_ALL_EVENT, &events[1][0],
++                          (uint32_t)remaining * SEC_TS_EVENT_SIZE))
++            return false;
++    }
++
++    for (i = 0; i <= remaining; i++)
++        sec_ts_handle_event(events[i]);
++
++    return true;
++}
++
++static bool
++sec_ts_wait_ready(void)
++{
++    uint8_t event[SEC_TS_EVENT_SIZE];
++    uint32_t retry;
++
++    for (retry = 0; retry < SEC_TS_READY_RETRIES; retry++) {
++        bzero(event, sizeof(event));
++
++        if (sec_i2c_read(SEC_TS_READ_ONE_EVENT, event, sizeof(event)) &&
++            event[0] != 0) {
++            uint8_t event_id = event[0] & 0x03u;
++            uint8_t subtype = (event[0] >> 2) & 0x0Fu;
++
++            if (event_id == 1u &&
++                (subtype == SEC_TS_STATUS_INFO ||
++                 subtype == SEC_TS_STATUS_VENDOR_INFO) &&
++                event[1] == SEC_TS_ACK_BOOT_COMPLETE)
++                return true;
++
++            /*
++             * Do not throw away a coordinate report that happens to
++             * arrive while waiting for the boot acknowledgment.
++             */
++            sec_ts_handle_event(event);
++        }
++
++        sec_sleep_ms(20);
++    }
++
++    return false;
++}
++
++static bool
++sec_ts_read_information(void)
++{
++    uint8_t device_id[5] = { 0 };
++    uint8_t panel[11] = { 0 };
++
++    if (!sec_i2c_read(SEC_TS_READ_DEVICE_ID, device_id,
++                      sizeof(device_id)))
++        return false;
++
++    if (!sec_i2c_read(SEC_TS_READ_PANEL_INFO, panel, sizeof(panel)))
++        return false;
++
++    sec_ts.tx_count = panel[8];
++    sec_ts.rx_count = panel[9];
++
++    if (sec_ts.tx_count == 0 || sec_ts.rx_count == 0)
++        return false;
++
++    printf("A10 SEC_TS: device ID %02x:%02x:%02x:%02x:%02x, "
++           "TX=%u RX=%u\n",
++           device_id[0], device_id[1], device_id[2],
++           device_id[3], device_id[4],
++           sec_ts.tx_count, sec_ts.rx_count);
++
++    return true;
++}
++
++static bool
++sec_ts_controller_init(void)
++{
++    if (sec_ts.regs == 0) {
++        sec_ts.regs = ml_io_map(A10_SEC_TS_I2C_BASE,
++                                A10_SEC_TS_I2C_SIZE);
++        if (sec_ts.regs == 0)
++            return false;
++    }
++
++    /*
++     * ACK enabled; divider 16 and the maximum scale divisor.
++     * IRQ generation is left disabled because this implementation
++     * polls the controller's pending bit.
++     */
++    sec_wr(IICCON, IICCON_ACKEN | IICCON_SCALE(0x0F) |
++                   IICCON_IRQPEND);
++
++    sec_ts.bus_ready = true;
++    return true;
++}
++
++static void
++sec_ts_thread(void *arg, wait_result_t wait_result)
++{
++    bool ready_logged = false;
++    bool init_logged = false;
++    unsigned int consecutive_errors = 0;
++
++    (void)arg;
++    (void)wait_result;
++
++    sec_ts.raw_max_x = SEC_TS_RAW_MAX_X;
++    sec_ts.raw_max_y = SEC_TS_RAW_MAX_Y;
++
++    for (;;) {
++        if (!sec_ts_controller_init()) {
++            if (!init_logged) {
++                printf("A10 SEC_TS: I2C MMIO mapping failed\n");
++                init_logged = true;
++            }
++            sec_sleep_ms(1000);
++            continue;
++        }
++
++        if (!sec_ts_wait_ready()) {
++            if (!ready_logged) {
++                printf("A10 SEC_TS: no boot-complete event; "
++                       "check bus, power, and pin mux\n");
++                ready_logged = true;
++            }
++            sec_sleep_ms(250);
++            continue;
++        }
++
++        if (!sec_ts_read_information()) {
++            sec_ts_release_all();
++            sec_sleep_ms(250);
++            continue;
++        }
++
++        if (!sec_i2c_write(SEC_TS_CMD_SENSE_ON, NULL, 0)) {
++            printf("A10 SEC_TS: SENSE_ON failed\n");
++            sec_sleep_ms(250);
++            continue;
++        }
++
++        printf("A10 SEC_TS: controller ready; HID touch bridge enabled\n");
++        break;
++    }
++
++    for (;;) {
++        if (sec_ts_read_event_batch()) {
++            consecutive_errors = 0;
++        } else {
++            consecutive_errors++;
++            if (consecutive_errors >= 3) {
++                sec_ts_release_all();
++                if (!sec_ts.logged_bus_error) {
++                    printf("A10 SEC_TS: repeated I2C event-read errors\n");
++                    sec_ts.logged_bus_error = true;
++                }
++                sec_sleep_ms(50);
++            }
++        }
++
++        sec_sleep_ms(SEC_TS_POLL_MS);
++    }
++}
++
++void
++a10_sec_touch_init(void)
++{
++    thread_t thread = THREAD_NULL;
++    kern_return_t kr;
++
++    if (sec_ts.started)
++        return;
++
++    sec_ts.started = true;
++    sec_ts.raw_max_x = SEC_TS_RAW_MAX_X;
++    sec_ts.raw_max_y = SEC_TS_RAW_MAX_Y;
++
++    kr = kernel_thread_start((thread_continue_t)sec_ts_thread,
++                             NULL, &thread);
++    if (kr != KERN_SUCCESS) {
++        sec_ts.started = false;
++        printf("A10 SEC_TS: could not start worker thread (0x%x)\n",
++               kr);
++        return;
++    }
++
++    thread_deallocate(thread);
++}
